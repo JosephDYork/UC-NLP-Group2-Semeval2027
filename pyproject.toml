@@ -1,0 +1,15 @@
+[project]
+name = "naturallanguageprocessing2026group2"
+version = "0.1.0"
+description = "Group 2's repository for UC-NLP's SemEval-2027 project"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastparquet>=2026.9.0",
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.6",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
