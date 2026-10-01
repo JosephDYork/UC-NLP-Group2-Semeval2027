@@ -1,44 +1,36 @@
-import pandas as pd
-from pathlib import Path
+from data import build_usages_table
+from tokenization import context_tokens, tokenize_span
 
 
 def main():
-    directory_path = Path("./data")
-    filenames = [file for file in directory_path.iterdir() if file.is_file()]
-    dataframes = {file_path.name:
-        pd.read_parquet(file_path)
-        for file_path in filenames
-    }
+    usages = build_usages_table()
 
-    print("TRAINING INPUTS:")
-    print("=======================")
-    for name, df in sorted(dataframes.items()):
-        print(f"{name}: Length: {len(df)}, Columns: {df.columns.to_list()}")
-    print("=======================")
+    sample = usages.iloc[0]
+    tokens = tokenize_span(sample.text)
+    context = context_tokens(sample)
+    metadata = "\n".join(
+        [
+            f"Word: {sample.word}",
+            f"Target form: {sample.target_form}",
+            f"Sentence ID: {sample.sentence_id}",
+            f"Period: {sample.period_label}",
+            f"Year: {sample.year}",
+            f"Span: ({sample.start}, {sample.end})",
+        ]
+    )
 
-    # directory_path = Path("./examples")
-    # filenames = [file for file in directory_path.iterdir() if file.is_file()]
-    # dataframes = {file_path.name:
-        # pd.read_parquet(file_path)
-        # for file_path in filenames
-    # }
-
-    forms = []
-    for row in dataframes["usages.parquet"].itertuples():
-        start = int(row[6])
-        end = int(row[7])
-        text = str(row[3])
-        if str(row[1]) == "motiv":
-            forms.append(text[start:end].lower().strip())
-
-    print(pd.unique(pd.Series(forms)))
-
-    # print()
-    # print("EXAMPLE OUTPUTS:")
-    # print("=======================")
-    # for name, df in sorted(dataframes.items()):
-        # print(f"{name}: Length: {len(df)}, Columns: {df.columns.to_list()}")
-    # print("=======================")
+    print(f"Example Usage")
+    print(f"=============")
+    print(f"{metadata}")
+    print()
+    print(f"Text:")
+    print(f"{sample.text}")
+    print()
+    print(f"Tokens with offsets:")
+    print(f"{tokens}")
+    print()
+    print(f"Context tokens:")
+    print(f"{context}")
 
 
 if __name__ == "__main__":
