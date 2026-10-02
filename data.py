@@ -1,13 +1,11 @@
-from pathlib import Path
-
 import pandas as pd
+from tokenization import context_tokens
 
 
-def build_usages_table():
-    dataframes = {path.name: pd.read_parquet(path) for path in Path("data").iterdir()}
-    usages = dataframes["usages.parquet"].copy()
-    usages["target_form"] = usages.apply(
-        lambda row: row.text[int(row.start) : int(row.end)].lower().strip(), axis=1
-    )
+def build_train_set(n_neighbors):
+    train = pd.read_parquet("data/usages.parquet")
+    train["target_form"] = train.apply(lambda row: row.text[int(row.start) : int(row.end)].lower().strip(), axis=1)
+    train["context_tokens"] = train.apply(lambda row: context_tokens(row, window=n_neighbors//2), axis=1)
+    train["context_size"] = train.context_tokens.map(len)
 
-    return usages
+    return train

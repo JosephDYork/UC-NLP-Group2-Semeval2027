@@ -1,36 +1,68 @@
-from data import build_usages_table
-from tokenization import context_tokens, tokenize_span
+from data import build_train_set
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+
+
+def print_section(title):
+    print(title)
+    print("=" * len(title))
 
 
 def main():
-    usages = build_usages_table()
+    n_neighbors = 8
+    train = build_train_set(n_neighbors)
 
-    sample = usages.iloc[0]
-    tokens = tokenize_span(sample.text)
-    context = context_tokens(sample)
-    metadata = "\n".join(
-        [
-            f"Word: {sample.word}",
-            f"Target form: {sample.target_form}",
-            f"Sentence ID: {sample.sentence_id}",
-            f"Period: {sample.period_label}",
-            f"Year: {sample.year}",
-            f"Span: ({sample.start}, {sample.end})",
-        ]
+    vectorizer = TfidfVectorizer(
+        analyzer="word",
+        tokenizer=lambda tokens: tokens,
+        preprocessor=lambda tokens: tokens,
+        token_pattern=None,
+        lowercase=False,
+        min_df=2,
     )
 
-    print(f"Example Usage")
-    print(f"=============")
-    print(f"{metadata}")
+    X = vectorizer.fit_transform(train.context_tokens)
+    X = normalize(X, norm="l2", copy=False)
+    feature_names = np.array(vectorizer.get_feature_names_out())
+
+    print_section("Train Set")
+    print(f"Rows: {len(train):,}")
+    print(f"Columns: {', '.join(train.columns)}")
+    print(f"Target words: {train.word.nunique():,}")
+    print(f"Period labels: {train.period_label.nunique():,}")
+    print(
+        f"Context window: {n_neighbors // 2} tokens per side, up to {n_neighbors} total"
+    )
+    print(
+        "Context size: "
+        f"min={train.context_size.min()}, "
+        f"median={train.context_size.median():.0f}, "
+        f"max={train.context_size.max()}"
+    )
     print()
-    print(f"Text:")
-    print(f"{sample.text}")
+    print("Rows per target word:")
+    print(train.word.value_counts().sort_index().to_string())
     print()
-    print(f"Tokens with offsets:")
-    print(f"{tokens}")
+
+    print_section("Vectorized Output")
+    print(f"Matrix shape: {X.shape[0]:,} rows x {X.shape[1]:,} features")
+    print(f"Non-zero values: {X.nnz:,}")
+    print(f"Density: {X.nnz / (X.shape[0] * X.shape[1]):.4%}")
+    print(f"Vocabulary size: {len(feature_names):,}")
     print()
-    print(f"Context tokens:")
-    print(f"{context}")
+
+    sample = train.iloc[2]
+    sample_vector = X[2]
+    top_indices = sample_vector.toarray().ravel().argsort()[::-1][:10]
+    top_terms = [feature_names[idx] for idx in top_indices if sample_vector[0, idx] > 0]
+
+    print_section("Vectorized Row")
+    print(f"Word: {sample.word}")
+    print(f"Sentence ID: {sample.sentence_id}")
+    print(f"Target form: {sample.target_form}")
+    print(f"Context tokens: {sample.context_tokens}")
+    print(f"Top TF-IDF terms: {', '.join(top_terms)}")
 
 
 if __name__ == "__main__":
