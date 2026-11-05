@@ -2,16 +2,31 @@
 name = "naturallanguageprocessing2026group2"
 version = "0.1.0"
 description = "Group 2's repository for UC-NLP's SemEval-2027 project"
-readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastparquet>=2026.9.0",
+    "fastparquet>=2024.11.0",
+    "hdbscan>=0.8.41",
     "matplotlib>=3.11.2",
-    "openpyxl>=3.1.5",
     "pandas>=3.0.6",
     "scikit-learn>=1.9.1",
+    "sentencepiece>=0.2.1",
+    "torch>=2.14.1",
+    "transformers>=5.18.0",
+    "requests>=2.34.2",
+    "umap-learn>=0.5.11",
 ]
 
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+
+[tool.ty.environment]
+root = ["."]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
