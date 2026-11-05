@@ -17,9 +17,7 @@ class RandomBaselineModel:
     def predict(self, rows):
         rng = np.random.default_rng(self.random_state)
         predictions = []
-
         for row in rows.itertuples():
             k = self.k_by_word.get(row.word, 1)
             predictions.append(f"{row.word}:{rng.integers(k)}")
-
         return predictions
