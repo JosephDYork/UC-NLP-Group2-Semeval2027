@@ -14,16 +14,6 @@ from models import (
     RandomBaselineModel,
     SingleLabelBaselineModel,
 )
-from tune import (
-    FEATURES,
-    MODELS,
-    REDUCERS,
-    baseline_configurations,
-    baseline_scores as tune_baseline_scores,
-    build_model,
-    reduce_embeddings,
-    score as tune_score,
-)
 
 TOKEN_RE = re.compile(r"\w+(?:[-']\w+)*|[^\w\s]", re.UNICODE)
 WORD_RE = re.compile(r"^\w+(?:[-']\w+)*$", re.UNICODE)
@@ -159,6 +149,18 @@ def jsd_spearman(model_class, rows, gold_by_sentence, **model_kwargs):
 
 
 def main():
+    # It's annoying, but the only way to avoid a circular import here
+    from tune import (
+        FEATURES,
+        MODELS,
+        REDUCERS,
+        baseline_configurations,
+        baseline_scores as tune_baseline_scores,
+        build_model,
+        reduce_embeddings,
+        score as tune_score,
+    )
+
     splits = build_splits()
     all_rows = pd.concat(splits.values()).sort_index()
     gold_by_sentence = (

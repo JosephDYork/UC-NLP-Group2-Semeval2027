@@ -380,7 +380,6 @@ def main():
     parser.add_argument("--no-test", action="store_true", help="skip test-split evaluation")
     parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
-    parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
     args = parser.parse_args()
 
     start = time.time()
