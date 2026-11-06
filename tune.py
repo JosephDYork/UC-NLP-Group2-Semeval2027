@@ -19,7 +19,6 @@ from models import (
     SingleLabelBaselineModel,
 )
 from reducers import AutoencoderReducer, UMAPReducer
-from subtask1b import consecutive_jsd, gold_jsd, sense_counts, spearman_1b
 
 RANDOM_STATE = 42
 
@@ -139,19 +138,7 @@ def reduce_embeddings(raw, fit_rows, reducer_config):
     return vectors
 
 
-def build_1b_context(splits, gold_by_sentence):
-    rows = pd.concat(list(splits.values())).sort_index()
-    return {"rows": rows, "gold": gold_jsd(rows, gold_by_sentence)}
-
-
-def score_1b(model, context):
-    rows = context["rows"]
-    predictions = model.fit(rows).predict(rows)
-    predicted = consecutive_jsd(sense_counts(rows, predictions))
-    return spearman_1b(context["gold"], predicted)
-
-
-def score(model, fit_rows, eval_rows, gold_by_sentence, context_1b=None):
+def score(model, fit_rows, eval_rows, gold_by_sentence):
     model.fit(fit_rows)
     predictions = model.predict(eval_rows)
     precision, recall, f1 = score_partition(eval_rows, predictions, gold_by_sentence)
@@ -167,15 +154,7 @@ def score(model, fit_rows, eval_rows, gold_by_sentence, context_1b=None):
         "f1": float(f1),
         "avg_clusters_per_word": float(n_clusters),
     }
-    if context_1b is not None:
-        result["rho_1b"] = score_1b(model, context_1b)
     return result
-
-
-def add_objective(frame, alpha):
-    frame = frame.copy()
-    frame["combined"] = alpha * frame["f1"] + (1 - alpha) * frame["rho_1b"]
-    return frame
 
 
 def build_model(model_class, params, vectors):
@@ -187,7 +166,7 @@ def build_model(model_class, params, vectors):
     )
 
 
-def run_search(args, splits, gold_by_sentence, context_1b):
+def run_search(args, splits, gold_by_sentence):
     trials = []
     reducer_names = QUICK_REDUCERS if args.quick else list(REDUCERS)
     for feature_name in args.features:
@@ -219,7 +198,6 @@ def run_search(args, splits, gold_by_sentence, context_1b):
                                 splits["train"],
                                 splits["validation"],
                                 gold_by_sentence,
-                                context_1b,
                             )
                         )
                     except Exception as error:  # keep going if one config blows up
@@ -247,7 +225,6 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
                 "reducer": trial.reducer,
                 "params": trial.params,
                 "val_f1": trial.f1,
-                "rho_1b": trial.rho_1b,
                 **{
                     f"test_{k}": v
                     for k, v in score(model, fit_rows, splits["test"], gold_by_sentence).items()
@@ -257,21 +234,33 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
     return pd.DataFrame(rows)
 
 
-def baseline_scores(splits, gold_by_sentence, context_1b):
-    rows = []
-    for name, model in [
-        ("One cluster per word", SingleLabelBaselineModel()),
-        ("Random (up to 8 clusters)", RandomBaselineModel(random_state=RANDOM_STATE)),
+def baseline_configurations():
+    return [
+        ("One cluster per word", SingleLabelBaselineModel, {}),
+        (
+            "Random (up to 8 clusters)",
+            RandomBaselineModel,
+            {"random_state": RANDOM_STATE},
+        ),
         (
             "TF-IDF + K-means",
-            KmeansModel(random_state=RANDOM_STATE, feature_source=TfidfEmbeddings()),
+            KmeansModel,
+            {"random_state": RANDOM_STATE, "feature_source": TfidfEmbeddings()},
         ),
-    ]:
+    ]
+
+
+def baseline_scores(fit_rows, evaluation_rows, gold_by_sentence):
+    rows = []
+    for name, model_class, model_kwargs in baseline_configurations():
         rows.append(
             {
                 "baseline": name,
                 **score(
-                    model, splits["train"], splits["validation"], gold_by_sentence, context_1b
+                    model_class(**model_kwargs),
+                    fit_rows,
+                    evaluation_rows,
+                    gold_by_sentence,
                 ),
             }
         )
@@ -299,15 +288,21 @@ def to_markdown(frame, float_cols=("precision", "recall", "f1")):
     return "\n".join(lines)
 
 
-def write_report(path, args, trials, baselines, test_results, elapsed):
+def write_report(path, args, trials, baselines, test_results, test_baselines, elapsed):
     ok = trials[trials["error"].isna()]
     failed = len(trials) - len(ok)
-    ranked = ok.sort_values("combined", ascending=False)
+    ranked = ok.sort_values("f1", ascending=False)
     best = ranked.groupby("model", sort=False).head(1)
 
     display_cols = [
-        "model", "features", "reducer", "params", "precision", "recall", "f1",
-        "rho_1b", "combined", "avg_clusters_per_word",
+        "model",
+        "features",
+        "reducer",
+        "params",
+        "precision",
+        "recall",
+        "f1",
+        "avg_clusters_per_word",
     ]
 
     def readable(frame):
@@ -324,10 +319,8 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         f"- Features: {', '.join(args.features)}",
         f"- Trials: {len(trials)} ({failed} failed)",
         f"- Runtime: {elapsed / 60:.1f} min",
-        f"- Selection metric: `combined` = {args.alpha:g} * BCubed F1 (1a) + {1 - args.alpha:g} * Spearman rho (1b)",
-        "  - 1a: BCubed F1 on the validation split, macro-averaged over target words (fit on train)",
-        "  - 1b: Spearman rho between gold and predicted consecutive-period JSD, over all usages "
-        "(refit transductively on all usages; pairs with < 10 gold usages dropped)",
+        "- Selection metric: validation BCubed F1 (Subtask 1a), macro-averaged over target words.",
+        "- Models are fit on the training split; validation gold labels are used only for selection.",
         "",
         "## Best configuration per model (validation)",
         "",
@@ -341,10 +334,13 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         out += [
             "## Best configurations on the held-out test split",
             "",
-            "Refit on train + validation, 1a scored once on test. "
-            "`rho_1b` is the transductive all-usage score (1b cannot be split).",
+            "Refit on train + validation, then score Subtask 1a once on test.",
             "",
             to_markdown(test_display),
+            "",
+            "## Baselines (held-out test)",
+            "",
+            to_markdown(test_baselines),
             "",
         ]
 
@@ -354,11 +350,7 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         to_markdown(baselines),
         "",
     ]
-    for metric, title in [
-        ("combined", "Best combined objective"),
-        ("f1", "Best validation BCubed F1 (1a)"),
-        ("rho_1b", "Best Spearman rho (1b)"),
-    ]:
+    for metric, title in [("f1", "Best validation BCubed F1 (1a)")]:
         out += [f"## {title} by model and reducer", ""]
         for feature_name, group in ok.groupby("features"):
             pivot = (
@@ -388,12 +380,7 @@ def main():
     parser.add_argument("--no-test", action="store_true", help="skip test-split evaluation")
     parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
-    parser.add_argument(
-        "--alpha",
-        type=float,
-        default=0.5,
-        help="weight of 1a BCubed F1 in the selection metric; 1b rho gets 1 - alpha",
-    )
+    parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
     args = parser.parse_args()
 
     start = time.time()
@@ -401,26 +388,42 @@ def main():
     gold = pd.read_parquet("data/subtask1.parquet")
     gold_by_sentence = gold.set_index("sentence_id").label.to_dict()
 
-    context_1b = build_1b_context(splits, gold_by_sentence)
-    print(f"Subtask 1b: {len(context_1b['gold'])} gold (word, period pair) items")
-
-    trials = add_objective(run_search(args, splits, gold_by_sentence, context_1b), args.alpha)
+    trials = run_search(args, splits, gold_by_sentence)
     if "error" not in trials:
         trials["error"] = None
-    baselines = add_objective(baseline_scores(splits, gold_by_sentence, context_1b), args.alpha)
+    baselines = baseline_scores(splits["train"], splits["validation"], gold_by_sentence)
 
-    ok = trials[trials["error"].isna()].sort_values("combined", ascending=False)
+    ok = trials[trials["error"].isna()].sort_values("f1", ascending=False)
     best = ok.groupby("model", sort=False).head(1)
     test_results = None if args.no_test else evaluate_best_on_test(best, splits, gold_by_sentence)
 
+    test_baselines = (
+        None
+        if args.no_test
+        else baseline_scores(
+            pd.concat([splits["train"], splits["validation"]]),
+            splits["test"],
+            gold_by_sentence,
+        )
+    )
+
     out_dir = args.output_dir / f"tuning_{datetime.now():%Y%m%d_%H%M%S}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    trials.sort_values("combined", ascending=False).to_csv(out_dir / "trials.csv", index=False)
+    trials.sort_values("f1", ascending=False).to_csv(out_dir / "trials.csv", index=False)
     if test_results is not None:
         test_results.to_csv(out_dir / "best_test.csv", index=False)
-    write_report(out_dir / "report.md", args, trials, baselines, test_results, time.time() - start)
+        test_baselines.to_csv(out_dir / "baseline_test.csv", index=False)
+    write_report(
+        out_dir / "report.md",
+        args,
+        trials,
+        baselines,
+        test_results,
+        test_baselines,
+        time.time() - start,
+    )
 
-    summary = best[["model", "features", "reducer", "params", "f1", "rho_1b", "combined"]].copy()
+    summary = best[["model", "features", "reducer", "params", "f1"]].copy()
     summary["params"] = summary["params"].map(format_params)
     summary = summary.rename(columns={"f1": "val_f1"})
     if test_results is not None:
