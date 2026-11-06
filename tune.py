@@ -9,7 +9,12 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import normalize
 
-from features import XLLexemeEmbeddings, XLMRobertaEmbeddings, TfidfEmbeddings
+from features import (
+    CALEXLMREmbeddings,
+    TfidfEmbeddings,
+    XLLexemeEmbeddings,
+    XLMRobertaEmbeddings,
+)
 from main import build_splits, score_partition
 from models import (
     GaussianMixtureModel,
@@ -23,17 +28,15 @@ from reducers import AutoencoderReducer, UMAPReducer
 RANDOM_STATE = 42
 
 FEATURES = {
+    "cale_xlmr": CALEXLMREmbeddings,
     "xl_lexeme": XLLexemeEmbeddings,
-    "xlm_roberta": XLMRobertaEmbeddings,
 }
 REDUCERS = {
     "none": {},
     "AE-20": {"autoencoder": {"n_components": 20}},
     "AE-64": {"autoencoder": {"n_components": 64, "hidden_dims": (512,)}},
     "AE-128": {"autoencoder": {"n_components": 128, "hidden_dims": (512,)}},
-    "UMAP-10 (nn=5)": {
-        "umap": {"n_components": 10, "n_neighbors": 5, "min_dist": 0.0}
-    },
+    "UMAP-10 (nn=5)": {"umap": {"n_components": 10, "n_neighbors": 5, "min_dist": 0.0}},
     "UMAP-10 (nn=15)": {
         "umap": {"n_components": 10, "n_neighbors": 15, "min_dist": 0.0}
     },
@@ -120,7 +123,9 @@ def reduce_embeddings(raw, fit_rows, reducer_config):
     reducers = []
     if "autoencoder" in reducer_config:
         reducers.append(
-            AutoencoderReducer(random_state=RANDOM_STATE, **reducer_config["autoencoder"])
+            AutoencoderReducer(
+                random_state=RANDOM_STATE, **reducer_config["autoencoder"]
+            )
         )
     if "umap" in reducer_config:
         reducers.append(
@@ -181,7 +186,9 @@ def run_search(args, splits, gold_by_sentence):
             for model_key in args.models:
                 model_name, model_class, space = MODELS[model_key]
                 configs = [
-                    p for p in space(args.quick) if is_valid(model_key, p, vectors.shape[1])
+                    p
+                    for p in space(args.quick)
+                    if is_valid(model_key, p, vectors.shape[1])
                 ]
                 start = time.time()
                 for params in configs:
@@ -217,7 +224,9 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
     for trial in best.itertuples():
         raw = FEATURES[trial.features]().load()
         vectors = reduce_embeddings(raw, fit_rows, REDUCERS[trial.reducer])
-        model = build_model(model_classes[trial.model], json.loads(trial.params), vectors)
+        model = build_model(
+            model_classes[trial.model], json.loads(trial.params), vectors
+        )
         rows.append(
             {
                 "model": trial.model,
@@ -227,7 +236,9 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
                 "val_f1": trial.f1,
                 **{
                     f"test_{k}": v
-                    for k, v in score(model, fit_rows, splits["test"], gold_by_sentence).items()
+                    for k, v in score(
+                        model, fit_rows, splits["test"], gold_by_sentence
+                    ).items()
                 },
             }
         )
@@ -277,7 +288,9 @@ def to_markdown(frame, float_cols=("precision", "recall", "f1")):
     for col in frame.columns:
         if pd.api.types.is_float_dtype(frame[col]):
             digits = 2 if col.endswith("avg_clusters_per_word") else 3
-            frame[col] = frame[col].map(lambda v: "" if pd.isna(v) else f"{v:.{digits}f}")
+            frame[col] = frame[col].map(
+                lambda v: "" if pd.isna(v) else f"{v:.{digits}f}"
+            )
     headers = list(frame.columns)
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -354,7 +367,9 @@ def write_report(path, args, trials, baselines, test_results, test_baselines, el
         out += [f"## {title} by model and reducer", ""]
         for feature_name, group in ok.groupby("features"):
             pivot = (
-                group.pivot_table(index="model", columns="reducer", values=metric, aggfunc="max")
+                group.pivot_table(
+                    index="model", columns="reducer", values=metric, aggfunc="max"
+                )
                 .reindex(columns=[r for r in REDUCERS if r in group.reducer.unique()])
                 .reset_index()
             )
@@ -362,10 +377,17 @@ def write_report(path, args, trials, baselines, test_results, test_baselines, el
 
     out += [f"## Top {args.top} configurations per model", ""]
     for model_name, group in ranked.groupby("model", sort=False):
-        out += [f"### {model_name}", "", to_markdown(readable(group.head(args.top))), ""]
+        out += [
+            f"### {model_name}",
+            "",
+            to_markdown(readable(group.head(args.top))),
+            "",
+        ]
 
     if failed:
-        errors = trials[trials["error"].notna()][["model", "features", "reducer", "params", "error"]]
+        errors = trials[trials["error"].notna()][
+            ["model", "features", "reducer", "params", "error"]
+        ]
         out += ["## Failed configurations", "", to_markdown(errors), ""]
 
     path.write_text("\n".join(out))
@@ -373,12 +395,24 @@ def write_report(path, args, trials, baselines, test_results, test_baselines, el
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=list(MODELS))
-    parser.add_argument("--features", nargs="+", choices=list(FEATURES), default=list(FEATURES))
-    parser.add_argument("--quick", action="store_true", help="tiny grid for smoke testing")
-    parser.add_argument("--no-test", action="store_true", help="skip test-split evaluation")
-    parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--models", nargs="+", choices=list(MODELS), default=list(MODELS)
+    )
+    parser.add_argument(
+        "--features", nargs="+", choices=list(FEATURES), default=list(FEATURES)
+    )
+    parser.add_argument(
+        "--quick", action="store_true", help="tiny grid for smoke testing"
+    )
+    parser.add_argument(
+        "--no-test", action="store_true", help="skip test-split evaluation"
+    )
+    parser.add_argument(
+        "--top", type=int, default=10, help="rows per model in the top-N tables"
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     args = parser.parse_args()
 
@@ -394,7 +428,9 @@ def main():
 
     ok = trials[trials["error"].isna()].sort_values("f1", ascending=False)
     best = ok.groupby("model", sort=False).head(1)
-    test_results = None if args.no_test else evaluate_best_on_test(best, splits, gold_by_sentence)
+    test_results = (
+        None if args.no_test else evaluate_best_on_test(best, splits, gold_by_sentence)
+    )
 
     test_baselines = (
         None
@@ -408,7 +444,9 @@ def main():
 
     out_dir = args.output_dir / f"tuning_{datetime.now():%Y%m%d_%H%M%S}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    trials.sort_values("f1", ascending=False).to_csv(out_dir / "trials.csv", index=False)
+    trials.sort_values("f1", ascending=False).to_csv(
+        out_dir / "trials.csv", index=False
+    )
     if test_results is not None:
         test_results.to_csv(out_dir / "best_test.csv", index=False)
         test_baselines.to_csv(out_dir / "baseline_test.csv", index=False)

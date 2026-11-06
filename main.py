@@ -1,10 +1,16 @@
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedShuffleSplit
 
-from features import TfidfEmbeddings, XLLexemeEmbeddings, XLMRobertaEmbeddings
+from features import (
+    TfidfEmbeddings,
+    XLLexemeEmbeddings,
+    XLMRobertaEmbeddings,
+    CALEXLMREmbeddings,
+)
 from reducers import AutoencoderReducer, UMAPReducer
 from subtask1b import consecutive_jsd, gold_jsd, sense_counts, spearman_1b
 from models import (
@@ -58,8 +64,13 @@ def build_train():
     return prepare_rows(pd.read_parquet("data/usages.parquet"))
 
 
-def build_splits(random_state=SPLIT_RANDOM_STATE):
-    rows = build_train()
+def build_synthetic_train(sentences_dir=SYNTHETIC_SENTENCES_DIR):
+    rows = pd.read_parquet(Path("synth_data/sythset_usages.parquet"))
+    rows["period_label"] = rows["year"].astype(str)
+    return prepare_rows(rows)
+
+
+def _build_splits(rows, random_state):
     train_indices, held_out_indices = next(
         StratifiedShuffleSplit(
             n_splits=1, test_size=0.30, random_state=random_state
@@ -76,6 +87,26 @@ def build_splits(random_state=SPLIT_RANDOM_STATE):
         "validation": held_out.iloc[validation_indices],
         "test": held_out.iloc[test_indices],
     }
+
+
+def build_splits(random_state=SPLIT_RANDOM_STATE):
+    return _build_splits(build_train(), random_state)
+
+
+def build_synthetic_splits(random_state=SPLIT_RANDOM_STATE):
+    return _build_splits(build_synthetic_train(), random_state)
+
+
+def synthetic_gold_by_sentence(rows=None):
+    if rows is None:
+        rows = build_synthetic_train()
+    return rows.set_index("sentence_id").label.to_dict()
+
+
+def synthetic_gold_jsd(rows=None):
+    if rows is None:
+        rows = build_synthetic_train()
+    return gold_jsd(rows, synthetic_gold_by_sentence(rows))
 
 
 def bcubed_f1(gold_sets, predicted_labels):
@@ -237,16 +268,16 @@ def main():
                 ),
             ],
         ),
-        "XLM-R": (
-            XLMRobertaEmbeddings,
+        "CALE-XLM-R": (
+            CALEXLMREmbeddings,
             [
                 (
                     "K-means",
                     "AE-64",
                     KmeansModel,
                     lambda: {
-                        "max_k": 4,
-                        "min_silhouette": 0.15,
+                        "max_k": 10,
+                        "min_silhouette": 0.05,
                         "max_iter": 100,
                         "autoencoder": AutoencoderReducer(
                             n_components=64, hidden_dims=(512,)
@@ -255,33 +286,38 @@ def main():
                 ),
                 (
                     "GMM",
-                    "None",
+                    "UMAP-10 (nn=15)",
                     GaussianMixtureModel,
                     lambda: {
                         "max_components": 4,
-                        "covariance_type": "spherical",
+                        "covariance_type": "full",
                         "reg_covar": 0.01,
+                        "umap": UMAPReducer(
+                            n_components=10, n_neighbors=15, min_dist=0.0
+                        ),
                     },
                 ),
                 (
                     "HDBSCAN",
-                    "AE-20",
+                    "AE-128",
                     HdbscanModel,
                     lambda: {
                         "min_cluster_size": 5,
-                        "min_samples": 3,
+                        "min_samples": 1,
                         "cluster_selection_method": "eom",
                         "allow_single_cluster": True,
                         "normalize_reduced": False,
                         "merge_noise": False,
-                        "autoencoder": AutoencoderReducer(n_components=20),
+                        "autoencoder": AutoencoderReducer(
+                            n_components=128, hidden_dims=(512,)
+                        ),
                     },
                 ),
             ],
         ),
     }
 
-    feature_keys = {"XL-LEXEME": "xl_lexeme", "XLM-R": "xlm_roberta"}
+    feature_keys = {"XL-LEXEME": "xl_lexeme", "CALE-XLM-R": "cale_xlmr"}
     model_keys = {"K-means": "kmeans", "GMM": "gmm", "HDBSCAN": "hdbscan"}
     gold_1b = gold_jsd(all_rows, gold_by_sentence)
 
