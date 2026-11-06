@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedShuffleSplit
 
-from features import TfidfEmbeddings, XLLexemeEmbeddings
+from features import TfidfEmbeddings, XLLexemeEmbeddings, XLMRobertaEmbeddings
+from reducers import AutoencoderReducer, UMAPReducer
+from subtask1b import consecutive_jsd, gold_jsd, sense_counts, spearman_1b
 from models import (
     GaussianMixtureModel,
     HdbscanModel,
@@ -12,7 +14,16 @@ from models import (
     RandomBaselineModel,
     SingleLabelBaselineModel,
 )
-from reducers import AutoencoderReducer, UMAPReducer
+from tune import (
+    FEATURES,
+    MODELS,
+    REDUCERS,
+    baseline_configurations,
+    baseline_scores as tune_baseline_scores,
+    build_model,
+    reduce_embeddings,
+    score as tune_score,
+)
 
 TOKEN_RE = re.compile(r"\w+(?:[-']\w+)*|[^\w\s]", re.UNICODE)
 WORD_RE = re.compile(r"^\w+(?:[-']\w+)*$", re.UNICODE)
@@ -138,128 +149,196 @@ def train_test(model_class, splits, **model_kwargs):
     )
 
 
+def jsd_spearman(model_class, rows, gold_by_sentence, **model_kwargs):
+    model_kwargs.setdefault("random_state", 42)
+    model = model_class(**model_kwargs).fit(rows)
+    predictions = model.predict(rows)
+    gold = gold_jsd(rows, gold_by_sentence)
+    predicted = consecutive_jsd(sense_counts(rows, predictions))
+    return spearman_1b(gold, predicted)
+
+
 def main():
     splits = build_splits()
+    all_rows = pd.concat(splits.values()).sort_index()
+    gold_by_sentence = (
+        pd.read_parquet("data/subtask1.parquet")
+        .set_index("sentence_id")
+        .label.to_dict()
+    )
 
-    baseline_configurations = [
-        ("One cluster per target word", SingleLabelBaselineModel, {}),
-        ("Random partition (up to 8 clusters)", RandomBaselineModel, {}),
-        ("TF-IDF + K-means", KmeansModel, {"feature_source": TfidfEmbeddings()}),
-    ]
-
-    model_configurations = [
-        ("K-means", KmeansModel, {}),
-        (
-            "HDBSCAN",
-            HdbscanModel,
-            {
-                "min_cluster_ratio": 0.04,
-                "allow_single_cluster": False,
-                "normalize_reduced": False,
-            },
-        ),
-        ("GMM", GaussianMixtureModel, {}),
-    ]
-
-    reducer_configurations = [
-        ("Raw embeddings", lambda: {}),
-        (
-            "AE-128",
-            lambda: {
-                "autoencoder": AutoencoderReducer(n_components=128, hidden_dims=(512,))
-            },
-        ),
-        (
-            "AE-128 + UMAP-10",
-            lambda: {
-                "autoencoder": AutoencoderReducer(n_components=128, hidden_dims=(512,)),
-                "umap": UMAPReducer(n_components=10, n_neighbors=5, min_dist=0.0),
-            },
-        ),
-        (
-            "CMCE AE-20 + UMAP-10",
-            lambda: {
-                "autoencoder": AutoencoderReducer(n_components=20),
-                "umap": UMAPReducer(n_components=10, n_neighbors=5, min_dist=0.0),
-            },
-        ),
-    ]
-
-    validation_grid, test_grid = [], []
-    for model_name, model_class, model_kwargs in model_configurations:
-        validation_scores = {"model": model_name}
-        # test_scores = {"model": model_name}
-        for reducer_name, build_reducers in reducer_configurations:
-            validation_result = train_validate(
-                model_class,
-                splits,
-                feature_source=XLLexemeEmbeddings(),
-                **model_kwargs,
-                **build_reducers(),
-            )
-            # test_result = train_test(
-            #     model_class,
-            #     splits,
-            #     feature_source=XLLexemeEmbeddings(),
-            #     **model_kwargs,
-            #     **build_reducers(),
-            # )
-            validation_scores[reducer_name] = validation_result["f1"]
-            # test_scores[reducer_name] = test_result["f1"]
-        validation_grid.append(validation_scores)
-        # test_grid.append(test_scores)
-
-    validation_baselines, test_baselines = [], []
-    for name, model_class, model_kwargs in baseline_configurations:
-        validation_baselines.append(
-            {
-                "baseline": name,
-                **train_validate(model_class, splits, **model_kwargs),
-            }
+    fit_rows = pd.concat([splits["train"], splits["validation"]])
+    test_baselines = tune_baseline_scores(fit_rows, splits["test"], gold_by_sentence)
+    for index, (_, model_class, model_kwargs) in enumerate(baseline_configurations()):
+        test_baselines.loc[index, "jsd_spearman"] = jsd_spearman(
+            model_class, all_rows, gold_by_sentence, **model_kwargs
         )
-        # test_baselines.append(
-        #     {
-        #         "baseline": name,
-        #         **train_test(model_class, splits, **model_kwargs),
-        #     }
-        # )
 
     print("Baselines (validation)")
     print(
-        pd.DataFrame(validation_baselines).to_string(
+        test_baselines.to_string(
             index=False,
             formatters={
                 "precision": "{:.3f}".format,
                 "recall": "{:.3f}".format,
                 "f1": "{:.3f}".format,
+                "jsd_spearman": "{:.3f}".format,
             },
         )
     )
-    print("\nXL-LEXEME validation F1 by model and reducer")
-    print(
-        pd.DataFrame(validation_grid).to_string(
-            index=False,
-            formatters={name: "{:.3f}".format for name, _ in reducer_configurations},
+
+    champions = {
+        "XL-LEXEME": (
+            XLLexemeEmbeddings,
+            [
+                (
+                    "K-means",
+                    "AE-64",
+                    KmeansModel,
+                    lambda: {
+                        "max_k": 10,
+                        "min_silhouette": 0.05,
+                        "max_iter": 100,
+                        "autoencoder": AutoencoderReducer(
+                            n_components=64, hidden_dims=(512,)
+                        ),
+                    },
+                ),
+                (
+                    "GMM",
+                    "UMAP-10 (nn=15)",
+                    GaussianMixtureModel,
+                    lambda: {
+                        "max_components": 4,
+                        "covariance_type": "full",
+                        "reg_covar": 0.01,
+                        "umap": UMAPReducer(
+                            n_components=10, n_neighbors=15, min_dist=0.0
+                        ),
+                    },
+                ),
+                (
+                    "HDBSCAN",
+                    "AE-128",
+                    HdbscanModel,
+                    lambda: {
+                        "min_cluster_size": 5,
+                        "min_samples": 1,
+                        "cluster_selection_method": "eom",
+                        "allow_single_cluster": True,
+                        "normalize_reduced": False,
+                        "merge_noise": False,
+                        "autoencoder": AutoencoderReducer(
+                            n_components=128, hidden_dims=(512,)
+                        ),
+                    },
+                ),
+            ],
+        ),
+        "XLM-R": (
+            XLMRobertaEmbeddings,
+            [
+                (
+                    "K-means",
+                    "AE-64",
+                    KmeansModel,
+                    lambda: {
+                        "max_k": 4,
+                        "min_silhouette": 0.15,
+                        "max_iter": 100,
+                        "autoencoder": AutoencoderReducer(
+                            n_components=64, hidden_dims=(512,)
+                        ),
+                    },
+                ),
+                (
+                    "GMM",
+                    "None",
+                    GaussianMixtureModel,
+                    lambda: {
+                        "max_components": 4,
+                        "covariance_type": "spherical",
+                        "reg_covar": 0.01,
+                    },
+                ),
+                (
+                    "HDBSCAN",
+                    "AE-20",
+                    HdbscanModel,
+                    lambda: {
+                        "min_cluster_size": 5,
+                        "min_samples": 3,
+                        "cluster_selection_method": "eom",
+                        "allow_single_cluster": True,
+                        "normalize_reduced": False,
+                        "merge_noise": False,
+                        "autoencoder": AutoencoderReducer(n_components=20),
+                    },
+                ),
+            ],
+        ),
+    }
+
+    feature_keys = {"XL-LEXEME": "xl_lexeme", "XLM-R": "xlm_roberta"}
+    model_keys = {"K-means": "kmeans", "GMM": "gmm", "HDBSCAN": "hdbscan"}
+    gold_1b = gold_jsd(all_rows, gold_by_sentence)
+
+    def score_1b(model):
+        predictions = model.fit(all_rows).predict(all_rows)
+        return spearman_1b(
+            gold_1b, consecutive_jsd(sense_counts(all_rows, predictions))
         )
-    )
-    # print("\nBaselines (test)")
-    # print(
-    #     pd.DataFrame(test_baselines).to_string(
-    #         index=False,
-    #         formatters={
-    #             "precision": "{:.3f}".format,
-    #             "recall": "{:.3f}".format,
-    #             "f1": "{:.3f}".format,
-    #         },
-    #     )
-    # )
-    # print("\nXL-LEXEME test F1 by model and reducer")
-    # print(
-    #     pd.DataFrame(test_grid).to_string(
-    #         index=False,
-    #         formatters={name: "{:.3f}".format for name, _ in reducer_configurations},
-    #     )
-    # )
+
+    for encoder_name, (_, configurations) in champions.items():
+        rows = []
+        for model_name, reducer_name, model_class, build_kwargs in configurations:
+            model_key = model_keys[model_name]
+            feature_key = feature_keys[encoder_name]
+            reducer_key = "none" if reducer_name == "None" else reducer_name
+            params = {
+                name: value
+                for name, value in build_kwargs().items()
+                if name not in {"autoencoder", "umap"}
+            }
+            raw = FEATURES[feature_key]().load()
+            validation_vectors = reduce_embeddings(
+                raw, splits["train"], REDUCERS[reducer_key]
+            )
+            validation_scores = tune_score(
+                build_model(MODELS[model_key][1], params, validation_vectors),
+                splits["train"],
+                splits["validation"],
+                gold_by_sentence,
+            )
+            rho_model = build_model(MODELS[model_key][1], params, validation_vectors)
+            test_vectors = reduce_embeddings(raw, fit_rows, REDUCERS[reducer_key])
+            test_scores = tune_score(
+                build_model(MODELS[model_key][1], params, test_vectors),
+                fit_rows,
+                splits["test"],
+                gold_by_sentence,
+            )
+            rows.append(
+                {
+                    "model": model_name,
+                    "reducer": reducer_name,
+                    "val_b3_f1": validation_scores["f1"],
+                    "test_b3_f1": test_scores["f1"],
+                    "jsd_spearman": score_1b(rho_model),
+                }
+            )
+
+        print(f"\n{encoder_name} champions")
+        print(
+            pd.DataFrame(rows).to_string(
+                index=False,
+                formatters={
+                    "val_b3_f1": "{:.3f}".format,
+                    "test_b3_f1": "{:.3f}".format,
+                    "jsd_spearman": "{:.3f}".format,
+                },
+            )
+        )
 
 
 if __name__ == "__main__":

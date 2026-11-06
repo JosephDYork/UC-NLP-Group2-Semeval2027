@@ -1,4 +1,0 @@
-model,features,reducer,params,val_f1,test_precision,test_recall,test_f1,test_avg_clusters_per_word
-HDBSCAN,xl_lexeme,AE-128,"{""min_cluster_ratio"": null, ""min_cluster_size"": 5, ""min_samples"": 1, ""cluster_selection_method"": ""eom"", ""allow_single_cluster"": true, ""normalize_reduced"": false}",0.7860482473829521,0.7098853847042206,0.8793502928070414,0.7729132969967071,3.2
-K-means,xl_lexeme,none,"{""max_k"": 10, ""min_silhouette"": 0.05, ""max_iter"": 100}",0.7496021892286656,0.7267876918898909,0.7812130436902981,0.7439430633038221,2.2
-GMM,xl_lexeme,none,"{""max_components"": 8, ""covariance_type"": ""diag"", ""reg_covar"": 0.001}",0.7472447931051038,0.6960324176555226,0.8463477761029801,0.7469921434509048,2.0
