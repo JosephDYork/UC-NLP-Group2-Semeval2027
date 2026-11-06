@@ -172,9 +172,19 @@ def score(model, fit_rows, eval_rows, gold_by_sentence, context_1b=None):
     return result
 
 
+# def add_objective(frame, alpha):
+#     frame = frame.copy()
+#     frame["combined"] = alpha * frame["f1"] + (1 - alpha) * frame["rho_1b"]
+#     return frame
+
+# Select hyperparameters based only on validation BCubed F1.
+# Spearman will be calculated separately after model selection.
+# Keep the "combined" column for compatibility with existing reporting code.
 def add_objective(frame, alpha):
     frame = frame.copy()
-    frame["combined"] = alpha * frame["f1"] + (1 - alpha) * frame["rho_1b"]
+    # Optimize using Subtask 1a BCubed F1 only.
+    # Spearman will be calculated after tuning.
+    frame["combined"] = frame["f1"]
     return frame
 
 
@@ -187,7 +197,7 @@ def build_model(model_class, params, vectors):
     )
 
 
-def run_search(args, splits, gold_by_sentence, context_1b):
+def run_search(args, splits, gold_by_sentence):
     trials = []
     reducer_names = QUICK_REDUCERS if args.quick else list(REDUCERS)
     for feature_name in args.features:
@@ -213,15 +223,26 @@ def run_search(args, splits, gold_by_sentence, context_1b):
                         "params": json.dumps(params),
                     }
                     try:
+                        # trial.update(
+                        #     score(
+                        #         build_model(model_class, params, vectors),
+                        #         splits["train"],
+                        #         splits["validation"],
+                        #         gold_by_sentence,
+                        #         context_1b,
+                        #     )
+                        # )
+        # Evaluate each hyperparameter configuration using BCubed F1 only.
+        # Spearman is excluded during tuning to avoid using test gold JSD
+        # for hyperparameter selection.
                         trial.update(
                             score(
-                                build_model(model_class, params, vectors),
-                                splits["train"],
-                                splits["validation"],
-                                gold_by_sentence,
-                                context_1b,
-                            )
+                            build_model(model_class, params, vectors),
+                            splits["train"],
+                            splits["validation"],
+                            gold_by_sentence,
                         )
+)
                     except Exception as error:  # keep going if one config blows up
                         trial["error"] = f"{type(error).__name__}: {error}"
                     trials.append(trial)
@@ -240,6 +261,18 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
         raw = FEATURES[trial.features]().load()
         vectors = reduce_embeddings(raw, fit_rows, REDUCERS[trial.reducer])
         model = build_model(model_classes[trial.model], json.loads(trial.params), vectors)
+        # Calculate Subtask 1b only after F1-based hyperparameter selection.
+        # This is a full-corpus descriptive score, NOT an independent test score.
+        all_rows = pd.concat(list(splits.values())).sort_index()
+        context_1b = {
+            "rows": all_rows,
+            "gold": gold_jsd(all_rows, gold_by_sentence),
+        }
+
+        post_tuning_rho = score_1b(
+            build_model(model_classes[trial.model], json.loads(trial.params), vectors),
+            context_1b,
+        )
         rows.append(
             {
                 "model": trial.model,
@@ -247,7 +280,8 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
                 "reducer": trial.reducer,
                 "params": trial.params,
                 "val_f1": trial.f1,
-                "rho_1b": trial.rho_1b,
+                # Spearman is reported after selection; it never influences tuning.
+                "post_tuning_rho_1b": post_tuning_rho,
                 **{
                     f"test_{k}": v
                     for k, v in score(model, fit_rows, splits["test"], gold_by_sentence).items()
@@ -257,7 +291,7 @@ def evaluate_best_on_test(best, splits, gold_by_sentence):
     return pd.DataFrame(rows)
 
 
-def baseline_scores(splits, gold_by_sentence, context_1b):
+def baseline_scores(splits, gold_by_sentence):
     rows = []
     for name, model in [
         ("One cluster per word", SingleLabelBaselineModel()),
@@ -270,8 +304,10 @@ def baseline_scores(splits, gold_by_sentence, context_1b):
         rows.append(
             {
                 "baseline": name,
+                # Evaluate baselines using the same F1-only criterion as tuning trials.
+                # Spearman will be evaluated separately after model selection.
                 **score(
-                    model, splits["train"], splits["validation"], gold_by_sentence, context_1b
+                    model, splits["train"], splits["validation"], gold_by_sentence #,context_1b
                 ),
             }
         )
@@ -305,10 +341,13 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
     ranked = ok.sort_values("combined", ascending=False)
     best = ranked.groupby("model", sort=False).head(1)
 
+    # Tuning tables contain F1-based metrics only.
+    # Spearman will be reported separately after model selection.
     display_cols = [
-        "model", "features", "reducer", "params", "precision", "recall", "f1",
-        "rho_1b", "combined", "avg_clusters_per_word",
-    ]
+        "model", "features", "reducer", "params",
+        "precision", "recall", "f1",
+        "combined", "avg_clusters_per_word",
+    ] # removed rho_1b reference: Without this change, generating the report could fail because rho_1b no longer exists in the tuning results
 
     def readable(frame):
         frame = frame[display_cols].copy()
@@ -324,10 +363,15 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         f"- Features: {', '.join(args.features)}",
         f"- Trials: {len(trials)} ({failed} failed)",
         f"- Runtime: {elapsed / 60:.1f} min",
-        f"- Selection metric: `combined` = {args.alpha:g} * BCubed F1 (1a) + {1 - args.alpha:g} * Spearman rho (1b)",
-        "  - 1a: BCubed F1 on the validation split, macro-averaged over target words (fit on train)",
-        "  - 1b: Spearman rho between gold and predicted consecutive-period JSD, over all usages "
-        "(refit transductively on all usages; pairs with < 10 gold usages dropped)",
+        # f"- Selection metric: `combined` = {args.alpha:g} * BCubed F1 (1a) + {1 - args.alpha:g} * Spearman rho (1b)",
+        # "  - 1a: BCubed F1 on the validation split, macro-averaged over target words (fit on train)",
+        # "  - 1b: Spearman rho between gold and predicted consecutive-period JSD, over all usages "
+        # Explain the F1-only selection method used in this experiment.
+        # Spearman is excluded from hyperparameter selection.
+        "- Selection metric: validation BCubed F1 (Subtask 1a) only.",
+        "  - BCubed F1 is macro-averaged over target words, with the model fitted on training usages.",
+        "  - Subtask 1b Spearman is calculated after model selection and does not influence tuning.",
+        # Post-tuning Spearman evaluation will be documented once implemented.
         "",
         "## Best configuration per model (validation)",
         "",
@@ -341,8 +385,16 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         out += [
             "## Best configurations on the held-out test split",
             "",
-            "Refit on train + validation, 1a scored once on test. "
-            "`rho_1b` is the transductive all-usage score (1b cannot be split).",
+            # "Refit on train + validation, 1a scored once on test. "
+            # "`rho_1b` is the transductive all-usage score (1b cannot be split).",
+
+            # Describe only the metrics currently calculated in the test stage.
+            # Subtask 1b Spearman will be added after model selection.
+            "Best configurations selected using validation BCubed F1 only. "
+            "Models are refitted on train + validation, and BCubed F1 is evaluated on test. "
+            "Post-tuning Spearman is calculated on the full corpus after F1-only "
+            "hyperparameter selection. It is a descriptive score, not an independent "
+            "held-out test score.",
             "",
             to_markdown(test_display),
             "",
@@ -354,10 +406,15 @@ def write_report(path, args, trials, baselines, test_results, elapsed):
         to_markdown(baselines),
         "",
     ]
+    # for metric, title in [
+    #     ("combined", "Best combined objective"),
+    #     ("f1", "Best validation BCubed F1 (1a)"),
+    #     ("rho_1b", "Best Spearman rho (1b)"),
+
+    # Rank configurations using validation BCubed F1 only.
+    # Spearman is excluded from tuning and will be reported after selection.
     for metric, title in [
-        ("combined", "Best combined objective"),
         ("f1", "Best validation BCubed F1 (1a)"),
-        ("rho_1b", "Best Spearman rho (1b)"),
     ]:
         out += [f"## {title} by model and reducer", ""]
         for feature_name, group in ok.groupby("features"):
@@ -388,11 +445,20 @@ def main():
     parser.add_argument("--no-test", action="store_true", help="skip test-split evaluation")
     parser.add_argument("--top", type=int, default=10, help="rows per model in the top-N tables")
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    # parser.add_argument(
+    #     "--alpha",
+    #     type=float,
+    #     default=0.5,
+    #     help="weight of 1a BCubed F1 in the selection metric; 1b rho gets 1 - alpha",
+    # )
+
+    # Retain --alpha for compatibility with existing calls.
+    # It no longer affects selection: only validation BCubed F1 is optimized.
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        help="weight of 1a BCubed F1 in the selection metric; 1b rho gets 1 - alpha",
+        default=1.0,
+        help="Deprecated: selection always uses BCubed F1 only.",
     )
     args = parser.parse_args()
 
@@ -404,10 +470,10 @@ def main():
     context_1b = build_1b_context(splits, gold_by_sentence)
     print(f"Subtask 1b: {len(context_1b['gold'])} gold (word, period pair) items")
 
-    trials = add_objective(run_search(args, splits, gold_by_sentence, context_1b), args.alpha)
+    trials = add_objective(run_search(args, splits, gold_by_sentence), args.alpha)
     if "error" not in trials:
         trials["error"] = None
-    baselines = add_objective(baseline_scores(splits, gold_by_sentence, context_1b), args.alpha)
+    baselines = add_objective(baseline_scores(splits, gold_by_sentence), args.alpha)
 
     ok = trials[trials["error"].isna()].sort_values("combined", ascending=False)
     best = ok.groupby("model", sort=False).head(1)
@@ -420,7 +486,11 @@ def main():
         test_results.to_csv(out_dir / "best_test.csv", index=False)
     write_report(out_dir / "report.md", args, trials, baselines, test_results, time.time() - start)
 
-    summary = best[["model", "features", "reducer", "params", "f1", "rho_1b", "combined"]].copy()
+    # summary = best[["model", "features", "reducer", "params", "f1", "rho_1b", "combined"]].copy()
+    # Report the best configurations selected using validation BCubed F1.
+    # Spearman is calculated separately after hyperparameter selection.
+    summary = best[["model", "features", "reducer", "params", "f1"]].copy()
+
     summary["params"] = summary["params"].map(format_params)
     summary = summary.rename(columns={"f1": "val_f1"})
     if test_results is not None:
