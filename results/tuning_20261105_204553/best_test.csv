@@ -1,0 +1,4 @@
+model,features,reducer,params,val_f1,rho_1b,test_precision,test_recall,test_f1,test_avg_clusters_per_word
+HDBSCAN,xl_lexeme,none,"{""min_cluster_ratio"": null, ""min_cluster_size"": 5, ""min_samples"": 1, ""cluster_selection_method"": ""eom"", ""allow_single_cluster"": true, ""normalize_reduced"": true, ""merge_noise"": true}",0.7373645471333501,0.573390474462904,0.6987509367137792,0.8317045920428552,0.7464084196479364,2.5
+GMM,xl_lexeme,AE-20,"{""max_components"": 8, ""covariance_type"": ""full"", ""reg_covar"": 1e-05}",0.7212836816368904,0.5638720633166072,0.6754567427344291,0.669329322750408,0.648429568408979,2.6
+K-means,xlm_roberta,AE-128,"{""max_k"": 6, ""min_silhouette"": 0.05, ""max_iter"": 300}",0.6334207170424082,0.5706941608226678,0.6478988422872329,0.5860683190138463,0.5743592042943318,2.6

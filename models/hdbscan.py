@@ -15,6 +15,7 @@ class HdbscanModel(BaseModel):
         normalize_reduced=True,
         cluster_selection_method="eom",
         allow_single_cluster=True,
+        merge_noise=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -24,6 +25,7 @@ class HdbscanModel(BaseModel):
         self.normalize_reduced = normalize_reduced
         self.cluster_selection_method = cluster_selection_method
         self.allow_single_cluster = allow_single_cluster
+        self.merge_noise = merge_noise
         self.training_vectors_by_word = {}
 
     def fit(self, train):
@@ -69,7 +71,11 @@ class HdbscanModel(BaseModel):
                 nearest_training_rows = distances.argmin(axis=1)
                 labels = model.labels_[nearest_training_rows]
             predictions[mask] = [
-                f"{word}:{label}" if label >= 0 else f"{word}:noise:{index}"
+                f"{word}:{label}"
+                if label >= 0
+                else f"{word}:noise"
+                if self.merge_noise
+                else f"{word}:noise:{index}"
                 for label, index in zip(labels, rows.index.to_numpy()[mask])
             ]
         return predictions.tolist()
