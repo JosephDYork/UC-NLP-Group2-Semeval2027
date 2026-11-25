@@ -1,61 +1,99 @@
+import quiet  # noqa: F401
 import argparse
-import numpy as np
+import os
 from pathlib import Path
-from main import build_synthetic_train, build_train
-from features import (
-    TfidfEmbeddings,
-    XLMRobertaEmbeddings,
-    XLLexemeEmbeddings,
-    CALEXLMREmbeddings,
-)
+
+import numpy as np
+from tqdm import tqdm
+
+from build_datasets import load_dataset
+from features import ENCODERS, TfidfEmbeddings
 
 
-def generate_target_embeddings(rows, embedding_model, output_path=None):
-    rows = rows.copy()
-    rows["_embedding_position"] = np.arange(len(rows))
-    all_embeddings = None
+def write_embeddings(rows, encoder, path, desc=None):
+    path = Path(path)
+    partial = path.with_suffix(".partial.npy")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    order = np.argsort(-rows.text.str.len().to_numpy(), kind="stable")
+    embeddings = None
 
-    for target_form, form_rows in rows.groupby("target_form", sort=False):
-        target_embeddings = embedding_model.generate(form_rows, target_form)
-        if all_embeddings is None:
-            shape = (len(rows), target_embeddings.shape[1])
-            all_embeddings = (
-                np.lib.format.open_memmap(
-                    output_path, mode="w+", dtype=target_embeddings.dtype, shape=shape
+    with tqdm(total=len(rows), desc=desc, unit="row", dynamic_ncols=True) as progress:
+        for batch_start in range(0, len(rows), encoder.batch_size):
+            positions = order[batch_start : batch_start + encoder.batch_size]
+            batch = encoder.generate(rows.iloc[positions])
+
+            if embeddings is None:
+                embeddings = np.lib.format.open_memmap(
+                    partial,
+                    mode="w+",
+                    dtype=batch.dtype,
+                    shape=(len(rows), batch.shape[1]),
                 )
-                if output_path is not None
-                else np.empty(shape, dtype=target_embeddings.dtype)
-            )
-        all_embeddings[form_rows._embedding_position.to_numpy()] = target_embeddings
 
-    if output_path is not None:
-        all_embeddings.flush()
+            embeddings[positions] = batch
+            progress.update(len(positions))
 
-    return all_embeddings
+    embeddings.flush()
+    del embeddings
+    os.replace(partial, path)
+
+
+def build_tfidf(rows, overwrite=False):
+    tfidf = TfidfEmbeddings()
+    path = Path(tfidf.path)
+    if path.exists():
+        if overwrite:
+            path.unlink()
+        else:
+            return path
+
+    print(f"Building tfidf, {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tfidf.save(rows)
+    return path
+
+
+def build_embeddings(rows, names=None, device="cuda", batch_size=None, overwrite=False):
+    paths = {}
+    names = list(ENCODERS) if names is None else names
+    for name in names:
+        encoder = ENCODERS[name](batch_size=batch_size, device=device)
+        path = Path(encoder.path)
+        paths[name] = path
+        if path.exists():
+            if overwrite:
+                path.unlink()
+            else:
+                continue
+
+        print(f"Building {name}, {path}")
+        write_embeddings(rows, encoder, path, desc=name)
+        del encoder
+
+    return paths
 
 
 def main():
-    embedding_dir = Path("embeddings")
-    embedding_dir.mkdir(parents=True, exist_ok=True)
-    train = build_synthetic_train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--encoders",
+        nargs="*",
+        choices=list(ENCODERS),
+        default=list(ENCODERS),
+    )
 
-    print("Building TF-IDF embeddings...")
-    TfidfEmbeddings().save(train)
+    args = parser.parse_args()
+    rows = load_dataset()
 
-    print(f"Building xlm-roberta embeddings...")
-    model = XLMRobertaEmbeddings()
-    embeddings = generate_target_embeddings(train, model)
-    np.save(model.path, embeddings)
-
-    print(f"Building xl-lexeme embeddings...")
-    model = XLLexemeEmbeddings()
-    embeddings = generate_target_embeddings(train, model)
-    np.save(model.path, embeddings)
-
-    print("Building CALE-XLM-R embeddings...")
-    model = CALEXLMREmbeddings()
-    embeddings = generate_target_embeddings(train, model)
-    np.save(model.path, embeddings)
+    build_tfidf(rows, overwrite=args.overwrite)
+    build_embeddings(
+        rows,
+        names=args.encoders,
+        device=args.device,
+        overwrite=args.overwrite,
+    )
 
 
 if __name__ == "__main__":

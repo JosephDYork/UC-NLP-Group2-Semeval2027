@@ -1,10 +1,21 @@
-import numpy as np
 from sklearn.mixture import GaussianMixture
 
 from .base import BaseModel
 
 
+def fit_gmm(vectors, n_components, covariance_type, reg_covar, random_state):
+    model = GaussianMixture(
+        n_components=n_components,
+        covariance_type=covariance_type,
+        reg_covar=reg_covar,
+        random_state=random_state,
+    ).fit(vectors)
+    return model, model.bic(vectors)
+
+
 class GaussianMixtureModel(BaseModel):
+    display_name = "GMM"
+
     def __init__(
         self, max_components=8, covariance_type="diag", reg_covar=1e-5, **kwargs
     ):
@@ -13,34 +24,51 @@ class GaussianMixtureModel(BaseModel):
         self.covariance_type = covariance_type
         self.reg_covar = reg_covar
 
-    def build_gmm(self, n_components):
-        return GaussianMixture(
-            n_components=n_components,
-            covariance_type=self.covariance_type,
-            reg_covar=self.reg_covar,
-            random_state=self.random_state,
+    @classmethod
+    def search_space(cls, quick=False, n_dims=None):
+        if quick:
+            return cls.grid(
+                max_components=[8], covariance_type=["diag"], reg_covar=[1e-3]
+            )
+        space = cls.grid(
+            max_components=[4, 8],
+            covariance_type=["diag", "spherical", "tied", "full"],
+            reg_covar=[1e-3, 1e-2, 1e-1, 1.0],
         )
 
-    def fit(self, train):
-        vectors = self.reduce(self.vectorize(train, fit=True), fit=True)
-        for word in train.word.unique():
-            word_vectors = vectors[train.word.eq(word).to_numpy()]
-            candidates = [
-                self.build_gmm(n).fit(word_vectors)
-                for n in range(1, min(self.max_components, len(word_vectors)) + 1)
-            ]
-            self.models_by_word[word] = min(
-                candidates, key=lambda model: model.bic(word_vectors)
-            )
+        if n_dims is not None and n_dims > 32:
+            space = [p for p in space if p["covariance_type"] != "full"]
 
-        return self
+        return space
 
-    def predict(self, rows):
-        vectors = self.reduce(self.vectorize(rows), fit=False)
-        predictions = np.empty(len(rows), dtype=object)
-        for word in rows.word.unique():
-            mask = rows.word.eq(word).to_numpy()
-            labels = self.models_by_word[word].predict(vectors[mask])
-            predictions[mask] = [f"{word}:{label}" for label in labels]
+    def key(self, word, n_components):
+        return ("gmm", word, n_components, self.covariance_type, self.reg_covar)
 
-        return predictions.tolist()
+    def fit_words(self, words):
+        candidates = {
+            word: range(1, min(self.max_components, len(positions)) + 1)
+            for word, positions in words.items()
+        }
+        fits = self.cached(
+            {
+                self.key(word, n): (
+                    lambda word=word, n=n: (
+                        fit_gmm,
+                        self.word_vectors(word),
+                        n,
+                        self.covariance_type,
+                        self.reg_covar,
+                        self.random_state,
+                    )
+                )
+                for word, ns in candidates.items()
+                for n in ns
+            }
+        )
+        self.models_by_word = {
+            word: min((fits[self.key(word, n)] for n in ns), key=lambda fit: fit[1])[0]
+            for word, ns in candidates.items()
+        }
+
+    def predict_word(self, word, vectors, index):
+        return self.models_by_word[word].predict(vectors)

@@ -98,12 +98,14 @@ class AutoencoderReducer:
             self.scaler.transform(vectors) if self.standardize else vectors
         )
 
-        inputs = torch.from_numpy(transformed_vectors.astype(np.float32)).to(
-            self.device
-        )
-
+        inputs = torch.from_numpy(transformed_vectors.astype(np.float32))
         with torch.inference_mode():
-            return self.model.encoder(inputs).cpu().numpy()
+            return np.concatenate(
+                [
+                    self.model.encoder(batch.to(self.device)).cpu().numpy()
+                    for batch in inputs.split(8192)
+                ]
+            )
 
     def fit_transform(self, vectors):
         return self.fit(vectors).transform(vectors)

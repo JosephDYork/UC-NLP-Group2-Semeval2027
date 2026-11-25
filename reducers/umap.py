@@ -1,5 +1,6 @@
 from umap import UMAP
 
+
 class UMAPReducer:
     def __init__(self, n_components=10, n_neighbors=15, min_dist=0.1, random_state=42):
         self.n_components = n_components

@@ -15,6 +15,10 @@ dependencies = [
     "requests>=2.34.2",
     "umap-learn>=0.5.11",
     "numpy>=2.5.3",
+    "tqdm",
+    "joblib>=1.6.0",
+    "threadpoolctl>=3",
+    "mdutils>=1.8.1",
 ]
 
 [tool.pyright]

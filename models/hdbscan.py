@@ -1,18 +1,38 @@
 import numpy as np
 from hdbscan import HDBSCAN
 from sklearn.metrics.pairwise import cosine_distances
-from sklearn.preprocessing import normalize
 
 from .base import BaseModel
 
 
+def fit_hdbscan_labels(
+    vectors,
+    min_cluster_size,
+    min_samples,
+    cluster_selection_method,
+    allow_single_cluster,
+):
+    return (
+        HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="precomputed",
+            cluster_selection_method=cluster_selection_method,
+            allow_single_cluster=allow_single_cluster,
+        )
+        .fit(cosine_distances(vectors).astype(np.float64))
+        .labels_
+    )
+
+
 class HdbscanModel(BaseModel):
+    display_name = "HDBSCAN"
+
     def __init__(
         self,
         min_cluster_size=5,
         min_samples=1,
         min_cluster_ratio=None,
-        normalize_reduced=True,
         cluster_selection_method="eom",
         allow_single_cluster=True,
         merge_noise=False,
@@ -22,60 +42,73 @@ class HdbscanModel(BaseModel):
         self.min_cluster_size = min_cluster_size
         self.min_samples = min_samples
         self.min_cluster_ratio = min_cluster_ratio
-        self.normalize_reduced = normalize_reduced
         self.cluster_selection_method = cluster_selection_method
         self.allow_single_cluster = allow_single_cluster
         self.merge_noise = merge_noise
-        self.training_vectors_by_word = {}
 
-    def fit(self, train):
-        vectors = self.reduce(self.vectorize(train, fit=True), fit=True)
-        vectors = normalize(vectors) if self.normalize_reduced else vectors
-        for word in train.word.unique():
-            word_vectors = vectors[train.word.eq(word).to_numpy()]
-            size = self.cluster_size_for(word_vectors)
-            if len(word_vectors) < size:
-                self.models_by_word[word] = None
+    @classmethod
+    def search_space(cls, quick=False, n_dims=None):
+        common = cls.grid(
+            cluster_selection_method=["eom"] if quick else ["eom", "leaf"],
+            allow_single_cluster=[False] if quick else [True, False],
+            merge_noise=[True] if quick else [False, True],
+        )
+        if quick:
+            sizing = [{"min_cluster_ratio": r} for r in (0.04, 0.08)]
+        else:
+            sizing = [{"min_cluster_ratio": r} for r in (0.02, 0.04, 0.06, 0.08, 0.12)]
+            sizing += cls.grid(
+                min_cluster_ratio=[None],
+                min_cluster_size=[3, 5, 10],
+                min_samples=[1, 3, 5],
+            )
+        return [{**s, **c} for s in sizing for c in common]
+
+    def fit_words(self, words):
+        tasks, keys = {}, {}
+        for word, positions in words.items():
+            size = self.cluster_size_for(len(positions))
+            if len(positions) < size:
+                keys[word] = None
                 continue
+            min_samples = (
+                size if self.min_cluster_ratio is not None else self.min_samples
+            )
+            key = (
+                "hdbscan",
+                word,
+                size,
+                min_samples,
+                self.cluster_selection_method,
+                self.allow_single_cluster,
+            )
+            tasks[key] = lambda word=word, size=size, min_samples=min_samples: (
+                fit_hdbscan_labels,
+                self.word_vectors(word),
+                size,
+                min_samples,
+                self.cluster_selection_method,
+                self.allow_single_cluster,
+            )
+            keys[word] = key
 
-            self.models_by_word[word] = HDBSCAN(
-                min_cluster_size=size,
-                min_samples=size
-                if self.min_cluster_ratio is not None
-                else self.min_samples,
-                metric="precomputed",
-                cluster_selection_method=self.cluster_selection_method,
-                allow_single_cluster=self.allow_single_cluster,
-            ).fit(cosine_distances(word_vectors).astype(np.float64))
-            self.training_vectors_by_word[word] = word_vectors
-        return self
+        labels = self.cached(tasks)
+        self.models_by_word = {
+            word: None if key is None else labels[key] for word, key in keys.items()
+        }
 
-    def cluster_size_for(self, vectors):
+    def cluster_size_for(self, n_rows):
         if self.min_cluster_ratio is None:
             return self.min_cluster_size
-        return max(int(self.min_cluster_ratio * len(vectors)), 2)
+        return max(int(self.min_cluster_ratio * n_rows), 2)
 
-    def predict(self, rows):
-        vectors = self.reduce(self.vectorize(rows), fit=False)
-        vectors = normalize(vectors) if self.normalize_reduced else vectors
-        predictions = np.empty(len(rows), dtype=object)
-        for word in rows.word.unique():
-            mask = rows.word.eq(word).to_numpy()
-            model = self.models_by_word.get(word)
-            if model is None:
-                labels = np.zeros(mask.sum(), dtype=int)
-            else:
-                distances = cosine_distances(
-                    vectors[mask], self.training_vectors_by_word[word]
-                )
-                nearest_training_rows = distances.argmin(axis=1)
-                labels = model.labels_[nearest_training_rows]
-            predictions[mask] = [
-                f"{word}:{label}"
-                if label >= 0
-                else f"{word}:noise"
-                if self.merge_noise
-                else f"{word}:noise:{index}"
-                for label, index in zip(labels, rows.index.to_numpy()[mask])
-            ]
-        return predictions.tolist()
+    def predict_word(self, word, vectors, index):
+        training_labels = self.models_by_word[word]
+        if training_labels is None:
+            return np.zeros(len(vectors), dtype=int)
+        distances = cosine_distances(vectors, self.word_vectors(word))
+        labels = training_labels[distances.argmin(axis=1)]
+        return [
+            label if label >= 0 else ("noise" if self.merge_noise else f"noise:{i}")
+            for label, i in zip(labels, index)
+        ]

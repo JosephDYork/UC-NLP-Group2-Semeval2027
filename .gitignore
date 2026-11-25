@@ -12,3 +12,7 @@ venv/
 .env.*
 
 embeddings/
+
+
+data_raw/
+data/external/

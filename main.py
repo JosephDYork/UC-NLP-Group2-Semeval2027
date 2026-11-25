@@ -1,382 +1,194 @@
-import re
-from pathlib import Path
+import quiet  # noqa: F401
+import argparse
+from typing import NamedTuple
 
-import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedShuffleSplit
 
-from features import (
-    TfidfEmbeddings,
-    XLLexemeEmbeddings,
-    XLMRobertaEmbeddings,
-    CALEXLMREmbeddings,
+from build_datasets import (
+    build_synthetic_splits,
+    load_dataset,
+    preprocess_dataset,
+    subsample_splits,
+    synthetic_gold_by_sentence,
 )
-from reducers import AutoencoderReducer, UMAPReducer
-from subtask1b import consecutive_jsd, gold_jsd, sense_counts, spearman_1b
-from models import (
-    GaussianMixtureModel,
-    HdbscanModel,
-    KmeansModel,
-    RandomBaselineModel,
-    SingleLabelBaselineModel,
+from build_embeddings import build_embeddings, build_tfidf
+from evaluations import bootstrap_ci, score_jsd_spearman
+from experiment import (
+    PrecomputedFeatures,
+    baseline_scores,
+    baselines,
+    build_model,
+    fit_and_score,
+    load_vectors,
 )
-
-TOKEN_RE = re.compile(r"\w+(?:[-']\w+)*|[^\w\s]", re.UNICODE)
-WORD_RE = re.compile(r"^\w+(?:[-']\w+)*$", re.UNICODE)
-SPLIT_RANDOM_STATE = 2027
+from features import TfidfEmbeddings
+from models import MODELS
 
 
-def target_index(tokens, start, end):
-    return max(
-        [
-            (i, min(token_end, end) - max(token_start, start))
-            for i, (_, token_start, token_end) in enumerate(tokens)
-        ],
-        key=lambda item: item[1],
-    )[0]
+class Config(NamedTuple):
+    model: str
+    features: str
+    reducer: str
+    params: dict
+    source: str
 
 
-def tokenize(row):
-    tokens = [
-        (match.group(), match.start(), match.end())
-        for match in TOKEN_RE.finditer(row.text)
-    ]
-    target = target_index(tokens, int(row.start), int(row.end))
+CONFIGS = [
+    Config(
+        "correlation",
+        "xl_durel",
+        "none",
+        {"threshold": 0.55, "threshold_quantile": None, "s": 10},
+        "results/tuning_20261111_022806 (all words)",
+    ),
+    Config(
+        "kmeans",
+        "xl_lexeme",
+        "AE-64",
+        {"max_k": 10, "min_silhouette": 0.05, "max_iter": 100},
+        "earlier XL-LEXEME tuning",
+    ),
+    Config(
+        "gmm",
+        "xl_lexeme",
+        "UMAP-10 (nn=15)",
+        {"max_components": 4, "covariance_type": "full", "reg_covar": 0.01},
+        "results/tuning_20261110_185943",
+    ),
+    Config(
+        "hdbscan",
+        "xl_lexeme",
+        "AE-128",
+        {
+            "min_cluster_size": 5,
+            "min_samples": 1,
+            "cluster_selection_method": "eom",
+            "allow_single_cluster": True,
+            "merge_noise": False,
+        },
+        "earlier XL-LEXEME tuning",
+    ),
+]
 
-    return [
-        token.lower()
-        for i, (token, _, _) in enumerate(tokens)
-        if i != target and WORD_RE.match(token) is not None
-    ]
+
+def subtask_1b(model, all_rows, gold_by_sentence):
+    predictions = model.fit(all_rows).predict(all_rows)
+    return score_jsd_spearman(all_rows, predictions, gold_by_sentence)
 
 
-def prepare_rows(rows):
-    rows = rows.copy()
-    rows["context_tokens"] = rows.apply(tokenize, axis=1)
-    rows["target_form"] = rows.apply(
-        lambda row: row.text[int(row.start) : int(row.end)].lower().strip(), axis=1
-    )
-
-    return rows
+def format_ci(word_f1):
+    low, high = bootstrap_ci(word_f1)
+    return f"[{low:.3f}, {high:.3f}]"
 
 
-def build_train():
-    return prepare_rows(pd.read_parquet("data/usages.parquet"))
+def evaluate_config(config, splits, gold_by_sentence, n_jobs):
+    train, validation, test = splits["train"], splits["validation"], splits["test"]
+    fit_rows = pd.concat([train, validation])
+    all_rows = pd.concat(splits.values())
+    model_class = MODELS[config.model]
 
+    def model(vectors):
+        return build_model(
+            model_class, config.params, vectors, config.reducer, n_jobs=n_jobs
+        )
 
-def build_synthetic_train(sentences_dir=SYNTHETIC_SENTENCES_DIR):
-    rows = pd.read_parquet(Path("synth_data/sythset_usages.parquet"))
-    rows["period_label"] = rows["year"].astype(str)
-    return prepare_rows(rows)
-
-
-def _build_splits(rows, random_state):
-    train_indices, held_out_indices = next(
-        StratifiedShuffleSplit(
-            n_splits=1, test_size=0.30, random_state=random_state
-        ).split(rows, rows.word)
-    )
-    held_out = rows.iloc[held_out_indices]
-    validation_indices, test_indices = next(
-        StratifiedShuffleSplit(
-            n_splits=1, test_size=0.50, random_state=random_state
-        ).split(held_out, held_out.word)
-    )
+    vectors = load_vectors(config.features, config.reducer, train, all_rows)
+    val = fit_and_score(model(vectors), train, validation, gold_by_sentence)
+    vectors = load_vectors(config.features, config.reducer, fit_rows, all_rows)
+    test = fit_and_score(model(vectors), fit_rows, test, gold_by_sentence)
     return {
-        "train": rows.iloc[train_indices],
-        "validation": held_out.iloc[validation_indices],
-        "test": held_out.iloc[test_indices],
+        "model": model_class.display_name,
+        "features": config.features,
+        "reducer": config.reducer,
+        "val_f1": val["f1"],
+        "test_f1": test["f1"],
+        "test_f1_95ci": format_ci(test["word_f1"]),
+        "test_clusters": test["avg_clusters_per_word"],
+        "jsd_spearman": subtask_1b(model(vectors), all_rows, gold_by_sentence),
     }
 
 
-def build_splits(random_state=SPLIT_RANDOM_STATE):
-    return _build_splits(build_train(), random_state)
+def evaluate_baselines(splits, gold_by_sentence, n_jobs):
+    fit_rows = pd.concat([splits["train"], splits["validation"]])
+    all_rows = pd.concat(splits.values())
+    tfidf = PrecomputedFeatures(TfidfEmbeddings().load())
+    scores = baseline_scores(fit_rows, splits["test"], gold_by_sentence, tfidf, n_jobs)
+    scores["test_f1_95ci"] = scores.word_f1.map(format_ci)
+    scores["jsd_spearman"] = [
+        subtask_1b(model, all_rows, gold_by_sentence)
+        for _, model in baselines(tfidf, n_jobs)
+    ]
+    return scores.rename(
+        columns={"f1": "test_f1", "avg_clusters_per_word": "test_clusters"}
+    )[["baseline", "test_f1", "test_f1_95ci", "test_clusters", "jsd_spearman"]]
 
 
-def build_synthetic_splits(random_state=SPLIT_RANDOM_STATE):
-    return _build_splits(build_synthetic_train(), random_state)
-
-
-def synthetic_gold_by_sentence(rows=None):
-    if rows is None:
-        rows = build_synthetic_train()
-    return rows.set_index("sentence_id").label.to_dict()
-
-
-def synthetic_gold_jsd(rows=None):
-    if rows is None:
-        rows = build_synthetic_train()
-    return gold_jsd(rows, synthetic_gold_by_sentence(rows))
-
-
-def bcubed_f1(gold_sets, predicted_labels):
-    precision, recall = [], []
-    for gold_i, predicted_i in zip(gold_sets, predicted_labels):
-        predicted_i = {predicted_i}
-        predicted_similarity = np.array(
-            [float(predicted_i == {label}) for label in predicted_labels]
-        )
-        gold_similarity = np.array(
-            [len(gold_i & gold_j) / len(gold_i | gold_j) for gold_j in gold_sets]
-        )
-        shared = (predicted_similarity * gold_similarity).sum()
-        precision.append(shared / predicted_similarity.sum())
-        recall.append(shared / gold_similarity.sum())
-    p, r = float(np.mean(precision)), float(np.mean(recall))
-
-    return p, r, 0.0 if p + r == 0 else 2 * p * r / (p + r)
-
-
-def score_partition(rows, predictions, gold_by_sentence):
-    predictions = np.asarray(predictions)
-    word_scores = []
-    for word, word_rows in rows.groupby("word", sort=False):
-        mask = rows.word.eq(word).to_numpy()
-        gold_sets = [
-            {str(sense) for sense in row.label}
-            for row in word_rows.merge(
-                pd.Series(gold_by_sentence, name="label"),
-                left_on="sentence_id",
-                right_index=True,
-                how="left",
-            ).itertuples()
-        ]
-        word_scores.append(bcubed_f1(gold_sets, predictions[mask]))
-
-    return np.mean(word_scores, axis=0)
-
-
-def evaluate(model_class, fit_rows, evaluation_rows, **model_kwargs):
-    gold = pd.read_parquet("data/subtask1.parquet")
-    gold_by_sentence = gold.set_index("sentence_id").label.to_dict()
-    model = model_class(random_state=42, **model_kwargs).fit(fit_rows)
-    precision, recall, f1 = score_partition(
-        evaluation_rows, model.predict(evaluation_rows), gold_by_sentence
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-
-    return {"precision": precision, "recall": recall, "f1": f1}
-
-
-def train_validate(model_class, splits, **model_kwargs):
-    return evaluate(model_class, splits["train"], splits["validation"], **model_kwargs)
-
-
-def train_test(model_class, splits, **model_kwargs):
-    return evaluate(
-        model_class,
-        pd.concat([splits["train"], splits["validation"]]),
-        splits["test"],
-        **model_kwargs,
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        choices=[config.model for config in CONFIGS],
+        default=[config.model for config in CONFIGS],
+        help="which configurations to evaluate, by model (default: all)",
     )
-
-
-def jsd_spearman(model_class, rows, gold_by_sentence, **model_kwargs):
-    model_kwargs.setdefault("random_state", 42)
-    model = model_class(**model_kwargs).fit(rows)
-    predictions = model.predict(rows)
-    gold = gold_jsd(rows, gold_by_sentence)
-    predicted = consecutive_jsd(sense_counts(rows, predictions))
-    return spearman_1b(gold, predicted)
+    parser.add_argument(
+        "--n-words",
+        type=int,
+        default=0,
+        help="evaluate on this many randomly sampled words (default 0 = all words)",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=-1,
+        help="parallel workers for per-word fits (-1 = all cores, 1 = serial)",
+    )
+    parser.add_argument(
+        "--device", default="cuda", help="torch device for any embeddings built"
+    )
+    return parser.parse_args()
 
 
 def main():
-    # It's annoying, but the only way to avoid a circular import here
-    from tune import (
-        FEATURES,
-        MODELS,
-        REDUCERS,
-        baseline_configurations,
-        baseline_scores as tune_baseline_scores,
-        build_model,
-        reduce_embeddings,
-        score as tune_score,
+    args = parse_args()
+    configs = [config for config in CONFIGS if config.model in args.models]
+
+    preprocess_dataset()
+    rows = load_dataset()
+    build_tfidf(rows)
+    build_embeddings(
+        rows, sorted({config.features for config in configs}), device=args.device
     )
 
-    splits = build_splits()
-    all_rows = pd.concat(splits.values()).sort_index()
-    gold_by_sentence = (
-        pd.read_parquet("data/subtask1.parquet")
-        .set_index("sentence_id")
-        .label.to_dict()
-    )
-
-    fit_rows = pd.concat([splits["train"], splits["validation"]])
-    test_baselines = tune_baseline_scores(fit_rows, splits["test"], gold_by_sentence)
-    for index, (_, model_class, model_kwargs) in enumerate(baseline_configurations()):
-        test_baselines.loc[index, "jsd_spearman"] = jsd_spearman(
-            model_class, all_rows, gold_by_sentence, **model_kwargs
-        )
-
-    print("Baselines (validation)")
-    print(
-        test_baselines.to_string(
-            index=False,
-            formatters={
-                "precision": "{:.3f}".format,
-                "recall": "{:.3f}".format,
-                "f1": "{:.3f}".format,
-                "jsd_spearman": "{:.3f}".format,
-            },
-        )
-    )
-
-    champions = {
-        "XL-LEXEME": (
-            XLLexemeEmbeddings,
-            [
-                (
-                    "K-means",
-                    "AE-64",
-                    KmeansModel,
-                    lambda: {
-                        "max_k": 10,
-                        "min_silhouette": 0.05,
-                        "max_iter": 100,
-                        "autoencoder": AutoencoderReducer(
-                            n_components=64, hidden_dims=(512,)
-                        ),
-                    },
-                ),
-                (
-                    "GMM",
-                    "UMAP-10 (nn=15)",
-                    GaussianMixtureModel,
-                    lambda: {
-                        "max_components": 4,
-                        "covariance_type": "full",
-                        "reg_covar": 0.01,
-                        "umap": UMAPReducer(
-                            n_components=10, n_neighbors=15, min_dist=0.0
-                        ),
-                    },
-                ),
-                (
-                    "HDBSCAN",
-                    "AE-128",
-                    HdbscanModel,
-                    lambda: {
-                        "min_cluster_size": 5,
-                        "min_samples": 1,
-                        "cluster_selection_method": "eom",
-                        "allow_single_cluster": True,
-                        "normalize_reduced": False,
-                        "merge_noise": False,
-                        "autoencoder": AutoencoderReducer(
-                            n_components=128, hidden_dims=(512,)
-                        ),
-                    },
-                ),
-            ],
-        ),
-        "CALE-XLM-R": (
-            CALEXLMREmbeddings,
-            [
-                (
-                    "K-means",
-                    "AE-64",
-                    KmeansModel,
-                    lambda: {
-                        "max_k": 10,
-                        "min_silhouette": 0.05,
-                        "max_iter": 100,
-                        "autoencoder": AutoencoderReducer(
-                            n_components=64, hidden_dims=(512,)
-                        ),
-                    },
-                ),
-                (
-                    "GMM",
-                    "UMAP-10 (nn=15)",
-                    GaussianMixtureModel,
-                    lambda: {
-                        "max_components": 4,
-                        "covariance_type": "full",
-                        "reg_covar": 0.01,
-                        "umap": UMAPReducer(
-                            n_components=10, n_neighbors=15, min_dist=0.0
-                        ),
-                    },
-                ),
-                (
-                    "HDBSCAN",
-                    "AE-128",
-                    HdbscanModel,
-                    lambda: {
-                        "min_cluster_size": 5,
-                        "min_samples": 1,
-                        "cluster_selection_method": "eom",
-                        "allow_single_cluster": True,
-                        "normalize_reduced": False,
-                        "merge_noise": False,
-                        "autoencoder": AutoencoderReducer(
-                            n_components=128, hidden_dims=(512,)
-                        ),
-                    },
-                ),
-            ],
-        ),
+    splits = build_synthetic_splits(rows=rows)
+    if args.n_words:
+        splits = subsample_splits(splits, args.n_words)
+    gold_by_sentence = synthetic_gold_by_sentence(pd.concat(splits.values()))
+    splits = {
+        name: split[["word", "sentence_id", "period_label"]]
+        for name, split in splits.items()
     }
+    del rows
+    print(
+        f"{splits['validation'].word.nunique()} words: "
+        + ", ".join(f"{name} {len(split)}" for name, split in splits.items())
+    )
 
-    feature_keys = {"XL-LEXEME": "xl_lexeme", "CALE-XLM-R": "cale_xlmr"}
-    model_keys = {"K-means": "kmeans", "GMM": "gmm", "HDBSCAN": "hdbscan"}
-    gold_1b = gold_jsd(all_rows, gold_by_sentence)
+    floats = {"float_format": "{:.3f}".format, "index": False}
+    print("\nBaselines")
+    print(evaluate_baselines(splits, gold_by_sentence, args.jobs).to_string(**floats))
 
-    def score_1b(model):
-        predictions = model.fit(all_rows).predict(all_rows)
-        return spearman_1b(
-            gold_1b, consecutive_jsd(sense_counts(all_rows, predictions))
-        )
-
-    for encoder_name, (_, configurations) in champions.items():
-        rows = []
-        for model_name, reducer_name, model_class, build_kwargs in configurations:
-            model_key = model_keys[model_name]
-            feature_key = feature_keys[encoder_name]
-            reducer_key = "none" if reducer_name == "None" else reducer_name
-            params = {
-                name: value
-                for name, value in build_kwargs().items()
-                if name not in {"autoencoder", "umap"}
-            }
-            raw = FEATURES[feature_key]().load()
-            validation_vectors = reduce_embeddings(
-                raw, splits["train"], REDUCERS[reducer_key]
-            )
-            validation_scores = tune_score(
-                build_model(MODELS[model_key][1], params, validation_vectors),
-                splits["train"],
-                splits["validation"],
-                gold_by_sentence,
-            )
-            rho_model = build_model(MODELS[model_key][1], params, validation_vectors)
-            test_vectors = reduce_embeddings(raw, fit_rows, REDUCERS[reducer_key])
-            test_scores = tune_score(
-                build_model(MODELS[model_key][1], params, test_vectors),
-                fit_rows,
-                splits["test"],
-                gold_by_sentence,
-            )
-            rows.append(
-                {
-                    "model": model_name,
-                    "reducer": reducer_name,
-                    "val_b3_f1": validation_scores["f1"],
-                    "test_b3_f1": test_scores["f1"],
-                    "jsd_spearman": score_1b(rho_model),
-                }
-            )
-
-        print(f"\n{encoder_name} champions")
-        print(
-            pd.DataFrame(rows).to_string(
-                index=False,
-                formatters={
-                    "val_b3_f1": "{:.3f}".format,
-                    "test_b3_f1": "{:.3f}".format,
-                    "jsd_spearman": "{:.3f}".format,
-                },
-            )
-        )
+    results = pd.DataFrame(
+        [
+            evaluate_config(config, splits, gold_by_sentence, args.jobs)
+            for config in configs
+        ]
+    )
+    print("\nConfigurations")
+    print(results.to_string(**floats))
 
 
 if __name__ == "__main__":

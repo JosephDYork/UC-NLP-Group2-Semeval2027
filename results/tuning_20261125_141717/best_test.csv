@@ -1,0 +1,2 @@
+model,features,reducer,params,val_f1,test_precision,test_recall,test_f1,test_avg_clusters_per_word,test_gold_clusters_per_word
+Correlation,xl_durel,none,"{""threshold"": 0.575, ""threshold_quantile"": null, ""s"": 10}",0.695551180862791,0.6427178307187619,0.7923628500428921,0.689534848001788,4.316666666666666,4.316666666666666

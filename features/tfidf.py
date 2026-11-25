@@ -1,11 +1,11 @@
-import numpy as np
+import scipy.sparse
 from sklearn.preprocessing import normalize
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 class TfidfEmbeddings:
-    def __init__(self, min_df=2, ngram_range=(1, 3)):
-        self.path = "embeddings/tfidf_embeddings.npy"
+    def __init__(self, min_df=2, ngram_range=(1, 1)):
+        self.path = "embeddings/tfidf_embeddings.npz"
         self.vectorizer = TfidfVectorizer(
             analyzer="word",
             tokenizer=lambda tokens: tokens,
@@ -20,7 +20,7 @@ class TfidfEmbeddings:
         return normalize(self.vectorizer.fit_transform(rows.context_tokens))
 
     def save(self, rows):
-        np.save(self.path, self.generate(rows).toarray())
+        scipy.sparse.save_npz(self.path, self.generate(rows).tocsr())
 
     def load(self):
-        return np.load(self.path)
+        return scipy.sparse.load_npz(self.path).tocsr()
